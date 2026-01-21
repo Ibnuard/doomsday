@@ -6,8 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint",
-    "postinstall": "node scripts/postinstall.mjs"
+    "lint": "eslint"
   },
   "dependencies": {
     "@sparticuz/chromium-min": "^143.0.4",
