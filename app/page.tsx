@@ -8,6 +8,17 @@ export default function Home() {
   const [videos, setVideos] = useState<string[]>([]);
   const [message, setMessage] = useState('');
   const [streamingUrl, setStreamingUrl] = useState<string | null>(null);
+  const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
+
+  const copyToClipboard = async (text: string, index: number) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedIndex(index);
+      setTimeout(() => setCopiedIndex(null), 2000);
+    } catch (err) {
+      console.error('Failed to copy:', err);
+    }
+  };
 
   const checkVideo = async () => {
     if (!url) return;
@@ -28,8 +39,10 @@ export default function Home() {
       const data = await res.json();
 
       if (data.success && data.videos && data.videos.length > 0) {
-        setVideos(data.videos);
-        setMessage(`Found ${data.videos.length} video(s)!`);
+        // Deduplikasi URL
+        const uniqueVideos = [...new Set<string>(data.videos)];
+        setVideos(uniqueVideos);
+        setMessage(`Found ${uniqueVideos.length} video(s)!`);
       } else if (data.success) {
         setMessage('No downloadable video found on this page.');
       } else {
@@ -46,7 +59,7 @@ export default function Home() {
     <div className="flex min-h-screen flex-col items-center justify-center bg-zinc-50 p-4 font-sans dark:bg-zinc-900">
       <main className="flex w-full max-w-2xl flex-col items-center gap-8 rounded-2xl bg-white p-8 shadow-xl dark:bg-zinc-800">
         <div className="text-center">
-          <h1 className="text-3xl font-bold text-zinc-900 dark:text-white">Video Grabber</h1>
+          <h1 className="text-3xl font-bold text-zinc-900 dark:text-white">Doomsday</h1>
           <p className="mt-2 text-zinc-600 dark:text-zinc-400">
             Enter a website URL to check for downloadable videos.
           </p>
@@ -107,7 +120,13 @@ export default function Home() {
                 <div className="flex-1 truncate text-sm text-zinc-600 dark:text-zinc-400" title={videoUrl}>
                   {videoUrl}
                 </div>
-                <div className="flex gap-2">
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={() => copyToClipboard(videoUrl, index)}
+                    className="rounded-md bg-zinc-600 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-700"
+                  >
+                    {copiedIndex === index ? '✓ Tersalin!' : '📋 Salin Link'}
+                  </button>
                   <button
                     onClick={() => setStreamingUrl(videoUrl)}
                     className="rounded-md bg-purple-600 px-4 py-2 text-sm font-medium text-white hover:bg-purple-700"
