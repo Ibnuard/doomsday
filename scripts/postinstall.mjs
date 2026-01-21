@@ -10,8 +10,15 @@ async function main() {
   try {
     console.log("📦 Starting postinstall script...");
 
-    // Resolve chromium package location
-    const chromiumResolvedPath = import.meta.resolve("@sparticuz/chromium");
+    // Try to resolve chromium package location
+    let chromiumResolvedPath;
+    try {
+      chromiumResolvedPath = import.meta.resolve("@sparticuz/chromium");
+    } catch {
+      console.log("⚠️  @sparticuz/chromium not found (might be in devDependencies only)");
+      console.log("   Skipping chromium archive creation - will use fallback URL in production");
+      return;
+    }
 
     // Convert file:// URL to regular path
     let chromiumPath = chromiumResolvedPath.replace(/^file:\/\/\//, "");
@@ -48,20 +55,11 @@ async function main() {
     console.log("   Source:", binDir);
     console.log("   Output:", outputPath);
 
-    // Use appropriate tar command based on platform
-    if (process.platform === "win32") {
-      // On Windows, use tar (available in Windows 10+)
-      execSync(`tar -cf "${outputPath}" -C "${binDir}" .`, {
-        stdio: "inherit",
-        cwd: projectRoot,
-      });
-    } else {
-      // Unix-like systems
-      execSync(`tar -cf "${outputPath}" -C "${binDir}" .`, {
-        stdio: "inherit",
-        cwd: projectRoot,
-      });
-    }
+    // Use tar command (available in Windows 10+ and Unix)
+    execSync(`tar -cf "${outputPath}" -C "${binDir}" .`, {
+      stdio: "inherit",
+      cwd: projectRoot,
+    });
 
     console.log("✅ Chromium archive created successfully!");
   } catch (error) {
