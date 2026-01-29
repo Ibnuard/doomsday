@@ -172,7 +172,124 @@ export async function POST(req: Request) {
       }
     }
 
-    // Find video elements in DOM
+    // === SMART CLICK LOOP TO TRIGGER ADS ===
+    const MAX_CLICK_ATTEMPTS = 15;
+    const CLICK_DELAY = 1500; // ms between clicks
+
+    console.log("Starting smart click loop to trigger ads...");
+
+    for (let attempt = 0; attempt < MAX_CLICK_ATTEMPTS; attempt++) {
+      // Check if we already found video URLs
+      if (videos.size > 0) {
+        console.log(`Video found after ${attempt} clicks! Stopping click loop.`);
+        break;
+      }
+
+      console.log(`Click attempt ${attempt + 1}/${MAX_CLICK_ATTEMPTS}...`);
+
+      try {
+        // Get viewport dimensions
+        const viewport = await page.evaluate(() => ({
+          width: window.innerWidth,
+          height: window.innerHeight,
+        }));
+
+        // Click in the center of the page (where overlays usually are)
+        const centerX = viewport.width / 2;
+        const centerY = viewport.height / 2;
+
+        // Add some randomness to avoid detection
+        const offsetX = Math.floor(Math.random() * 100) - 50;
+        const offsetY = Math.floor(Math.random() * 100) - 50;
+
+        await page.mouse.click(centerX + offsetX, centerY + offsetY);
+
+        // Handle any popup windows that might open
+        const pages = await browser.pages();
+        if (pages.length > 1) {
+          console.log(`Closing ${pages.length - 1} popup window(s)...`);
+          for (let i = 1; i < pages.length; i++) {
+            await pages[i].close();
+          }
+        }
+
+        // Try to click common skip/close buttons
+        await page.evaluate(() => {
+          const skipSelectors = [
+            '[class*="skip"]',
+            '[class*="close"]',
+            '[class*="dismiss"]',
+            '[id*="skip"]',
+            '[id*="close"]',
+            'button[class*="ad"]',
+            '.close-btn',
+            '.skip-btn',
+            '.skip-ad',
+            '[aria-label*="skip"]',
+            '[aria-label*="close"]',
+            '[title*="close"]',
+            '[title*="skip"]',
+          ];
+
+          for (const selector of skipSelectors) {
+            const elements = document.querySelectorAll(selector);
+            elements.forEach((el) => {
+              if (el instanceof HTMLElement && el.offsetParent !== null) {
+                el.click();
+              }
+            });
+          }
+        });
+
+        // Also try to click any play buttons
+        await page.evaluate(() => {
+          const playSelectors = [
+            '[class*="play"]',
+            '[id*="play"]',
+            'button[class*="play"]',
+            '.play-btn',
+            '[aria-label*="play"]',
+            'video',
+          ];
+
+          for (const selector of playSelectors) {
+            const elements = document.querySelectorAll(selector);
+            elements.forEach((el) => {
+              if (el instanceof HTMLElement && el.offsetParent !== null) {
+                el.click();
+              }
+            });
+          }
+        });
+
+        // Wait before next click
+        await new Promise((resolve) => setTimeout(resolve, CLICK_DELAY));
+
+        // Check DOM for videos after each click
+        const domVideosInLoop = await page.evaluate(() => {
+          const found: string[] = [];
+          document.querySelectorAll("video").forEach((v) => {
+            if (v.src) found.push(v.src);
+            if (v.currentSrc) found.push(v.currentSrc);
+          });
+          document.querySelectorAll("source").forEach((s) => {
+            if (s.src) found.push(s.src);
+          });
+          return found;
+        });
+
+        domVideosInLoop.forEach((v: string) => {
+          if (v && !v.startsWith("blob:")) {
+            videos.add(v);
+          }
+        });
+
+      } catch (clickError) {
+        console.log(`Click attempt ${attempt + 1} failed:`, clickError);
+      }
+    }
+
+    // Final DOM check for videos
     const domVideos = await page.evaluate(() => {
       const foundVideos: string[] = [];
       document.querySelectorAll("video").forEach((v) => {
