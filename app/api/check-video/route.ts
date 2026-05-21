@@ -17,6 +17,184 @@ function resolveUrl(src: string, base: URL): string {
 }
 
 /**
+ * Detects Cloudflare anti-bot challenge pages. These come back with 200 or 403
+ * and contain telltale markers like "Just a moment..." or the cf-chl- script tag.
+ */
+function isCloudflareChallenge(html: string): boolean {
+  if (!html || html.length < 1000) return false;
+  const lower = html.toLowerCase();
+  return (
+    lower.includes("just a moment") ||
+    lower.includes("cf-chl-bypass") ||
+    lower.includes("__cf_chl_") ||
+    lower.includes("cf_chl_opt") ||
+    (lower.includes("challenge-platform") && lower.includes("cloudflare"))
+  );
+}
+
+/**
+ * Fetches HTML for a URL. Tries direct fetch first, then transparently retries
+ * through ScraperAPI when Cloudflare blocks the request. Requires SCRAPERAPI_KEY
+ * env var for the fallback to work — without it, only direct fetch is attempted.
+ */
+async function fetchHtml(
+  pageUrl: string,
+  depth: number,
+  referer?: string
+): Promise<string | null> {
+  const baseUrl = new URL(pageUrl);
+  const headers: Record<string, string> = {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    Referer: referer || baseUrl.origin + "/",
+    Accept:
+      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": depth === 0 ? "document" : "iframe",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": depth === 0 ? "none" : "same-origin",
+  };
+
+  // First attempt: direct fetch
+  try {
+    const response = await fetch(pageUrl, { headers, redirect: "follow" });
+    console.log(
+      `[Phase 1] direct depth=${depth} ${pageUrl} -> ${response.status} ${response.statusText}`
+    );
+
+    const blockedStatus =
+      response.status === 403 ||
+      response.status === 429 ||
+      response.status === 503;
+
+    if (response.ok || (!blockedStatus && response.status < 500)) {
+      const html = await response.text();
+      if (response.ok && !isCloudflareChallenge(html)) {
+        return html;
+      }
+      console.log(
+        `[Phase 1] direct hit Cloudflare challenge or non-ok (${html.length} chars), trying ScraperAPI...`
+      );
+    } else {
+      console.log(`[Phase 1] direct blocked (${response.status}), trying ScraperAPI...`);
+    }
+  } catch (e) {
+    console.log(`[Phase 1] direct fetch threw:`, e);
+  }
+
+  // Tier 2: ScraperAPI (residential IPs + JS rendering for Cloudflare challenges)
+  const key = process.env.SCRAPERAPI_KEY;
+  if (key) {
+    try {
+      const proxyUrl = new URL("https://api.scraperapi.com/");
+      proxyUrl.searchParams.set("api_key", key);
+      proxyUrl.searchParams.set("url", pageUrl);
+      // render=true executes JS — required to clear Cloudflare's "Just a moment..." challenge
+      proxyUrl.searchParams.set("render", "true");
+      proxyUrl.searchParams.set("keep_headers", "true");
+      if (referer) proxyUrl.searchParams.set("referer", referer);
+
+      const response = await fetch(proxyUrl.toString(), { headers });
+      console.log(
+        `[Phase 1] scraperapi depth=${depth} ${pageUrl} -> ${response.status} ${response.statusText}`
+      );
+
+      if (response.ok) {
+        const html = await response.text();
+        if (!isCloudflareChallenge(html)) return html;
+        console.log("[Phase 1] scraperapi response still looks like Cloudflare challenge");
+      } else {
+        const snippet = await response.text().catch(() => "");
+        console.log(`[Phase 1] scraperapi error body:`, snippet.slice(0, 200));
+      }
+    } catch (e) {
+      console.log(`[Phase 1] scraperapi threw:`, e);
+    }
+  } else {
+    console.log("[Phase 1] SCRAPERAPI_KEY not set — skipping tier 2");
+  }
+
+  // Tier 3: Headless Chromium (last resort, slow cold start but handles anything)
+  try {
+    const html = await fetchWithChromium(pageUrl, referer);
+    if (html && !isCloudflareChallenge(html)) {
+      console.log(`[Phase 1] chromium succeeded depth=${depth} (${html.length} chars)`);
+      return html;
+    }
+    console.log("[Phase 1] chromium returned challenge or empty");
+  } catch (e) {
+    console.log("[Phase 1] chromium threw:", e);
+  }
+
+  return null;
+}
+
+/**
+ * Cached chromium executable path so we don't re-download on every request.
+ */
+let cachedChromiumPath: string | null = null;
+const CHROMIUM_PACK_URL =
+  "https://github.com/Sparticuz/chromium/releases/download/v131.0.1/chromium-v131.0.1-pack.tar";
+
+async function getChromiumPath(): Promise<string> {
+  if (cachedChromiumPath) return cachedChromiumPath;
+  const chromium = (await import("@sparticuz/chromium-min")).default;
+  cachedChromiumPath = await chromium.executablePath(CHROMIUM_PACK_URL);
+  return cachedChromiumPath;
+}
+
+/**
+ * Fetches a page using headless Chromium. Handles Cloudflare JS challenges
+ * naturally because the browser executes them like a real client.
+ */
+async function fetchWithChromium(
+  pageUrl: string,
+  referer?: string
+): Promise<string | null> {
+  const isVercel = !!process.env.VERCEL_ENV;
+
+  // Local dev: skip chromium (direct fetch usually works on residential IP)
+  if (!isVercel) {
+    console.log("[Phase 1] chromium tier disabled in local dev");
+    return null;
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let browser: any = null;
+  try {
+    const chromium = (await import("@sparticuz/chromium-min")).default;
+    const puppeteer = await import("puppeteer-core");
+    const executablePath = await getChromiumPath();
+
+    browser = await puppeteer.launch({
+      args: chromium.args,
+      executablePath,
+      headless: true,
+    });
+
+    const page = await browser.newPage();
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    );
+    if (referer) {
+      await page.setExtraHTTPHeaders({ Referer: referer });
+    }
+
+    await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+    // Wait a bit for Cloudflare challenge to clear
+    await new Promise((r) => setTimeout(r, 5000));
+
+    return await page.content();
+  } finally {
+    if (browser) {
+      try {
+        await browser.close();
+      } catch {}
+    }
+  }
+}
+
+/**
  * Static HTML extraction. Fetches a page, parses video/source/iframe tags,
  * resolves JavaScript variable concatenation in iframe URLs, and recursively
  * follows iframe chains until a direct video URL is found.
@@ -34,41 +212,8 @@ async function extractVideosFromHTML(
   const baseUrl = new URL(pageUrl);
 
   try {
-    const response = await fetch(pageUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Referer: referer || baseUrl.origin + "/",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Fetch-Dest": depth === 0 ? "document" : "iframe",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": depth === 0 ? "none" : "same-origin",
-      },
-      redirect: "follow",
-    });
-
-    console.log(
-      `[Phase 1] depth=${depth} fetch ${pageUrl} -> ${response.status} ${response.statusText} (final: ${response.url})`
-    );
-
-    if (!response.ok) {
-      const snippet = await response.text().catch(() => "");
-      console.log(
-        `[Phase 1] non-ok body snippet (${snippet.length} chars):`,
-        snippet.slice(0, 200)
-      );
-      return [];
-    }
-    const html = await response.text();
-
-    if (html.length < 200) {
-      console.log(
-        `[Phase 1] suspiciously small body (${html.length} chars):`,
-        html.slice(0, 200)
-      );
-    }
+    const html = await fetchHtml(pageUrl, depth, referer);
+    if (html === null) return [];
 
     let match: RegExpExecArray | null;
 
