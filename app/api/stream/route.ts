@@ -1,5 +1,9 @@
 import { NextRequest } from "next/server";
 
+export const runtime = "nodejs";
+export const preferredRegion = ["sin1", "hkg1", "icn1"];
+export const maxDuration = 300;
+
 /**
  * Streaming proxy for hotlink-protected videos.
  *

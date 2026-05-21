@@ -1,5 +1,11 @@
 import { NextResponse } from "next/server";
 
+// Run in Singapore (closest Vercel region to Indonesian video hosts).
+// Many SEA hosts geo-block US datacenter IPs, so US regions return blank pages.
+export const runtime = "nodejs";
+export const preferredRegion = ["sin1", "hkg1", "icn1"];
+export const maxDuration = 60;
+
 /**
  * Resolves a potentially relative URL against a base URL.
  */
@@ -40,10 +46,29 @@ async function extractVideosFromHTML(
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": depth === 0 ? "none" : "same-origin",
       },
+      redirect: "follow",
     });
 
-    if (!response.ok) return [];
+    console.log(
+      `[Phase 1] depth=${depth} fetch ${pageUrl} -> ${response.status} ${response.statusText} (final: ${response.url})`
+    );
+
+    if (!response.ok) {
+      const snippet = await response.text().catch(() => "");
+      console.log(
+        `[Phase 1] non-ok body snippet (${snippet.length} chars):`,
+        snippet.slice(0, 200)
+      );
+      return [];
+    }
     const html = await response.text();
+
+    if (html.length < 200) {
+      console.log(
+        `[Phase 1] suspiciously small body (${html.length} chars):`,
+        html.slice(0, 200)
+      );
+    }
 
     let match: RegExpExecArray | null;
 
