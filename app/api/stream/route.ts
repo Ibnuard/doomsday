@@ -35,6 +35,7 @@ export async function GET(req: NextRequest) {
   const ref = searchParams.get("ref");
   const expStr = searchParams.get("exp");
   const sig = searchParams.get("sig");
+  const downloadMode = searchParams.get("download") === "1";
 
   if (!videoUrl) return badRequest("Missing url");
   if (!expStr || !sig) return forbidden("Missing signature");
@@ -94,15 +95,16 @@ export async function GET(req: NextRequest) {
     /application\/(vnd\.apple\.)?(mpegurl|x-mpegurl)/i.test(contentType);
 
   if (isHls) {
+    // download flag is meaningless for a playlist file; ignore it.
     return rewriteHlsManifest(upstream, target, ref, exp, sig, secret);
   }
 
-  return passThrough(upstream);
+  return passThrough(upstream, downloadMode ? deriveFilename(target) : null);
 }
 
 // ---------------------------------------------------------------------------
 
-function passThrough(upstream: Response): Response {
+function passThrough(upstream: Response, downloadFilename: string | null): Response {
   const responseHeaders = new Headers();
   const passthrough = [
     "content-type",
@@ -127,10 +129,33 @@ function passThrough(upstream: Response): Response {
   responseHeaders.set("access-control-allow-origin", "*");
   responseHeaders.set("access-control-expose-headers", "content-length,content-range");
 
+  if (downloadFilename) {
+    // RFC 5987 encoding handles non-ASCII characters; quote the ASCII fallback.
+    const ascii = downloadFilename.replace(/[^\x20-\x7E]/g, "_").replace(/"/g, "");
+    const utf8 = encodeURIComponent(downloadFilename);
+    responseHeaders.set(
+      "content-disposition",
+      `attachment; filename="${ascii}"; filename*=UTF-8''${utf8}`
+    );
+  }
+
   return new Response(upstream.body, {
     status: upstream.status,
     headers: responseHeaders,
   });
+}
+
+/**
+ * Derive a friendly download filename from the upstream URL. Falls back to
+ * "video.mp4" when the path contains nothing usable.
+ */
+function deriveFilename(target: URL): string {
+  const last = target.pathname.split("/").filter(Boolean).pop() ?? "";
+  const candidate = decodeURIComponent(last).split("?")[0];
+  if (candidate && /\.[a-z0-9]{2,5}$/i.test(candidate)) {
+    return candidate;
+  }
+  return "video.mp4";
 }
 
 /**
