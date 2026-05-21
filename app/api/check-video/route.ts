@@ -4,7 +4,7 @@ import { NextResponse } from "next/server";
 // Many SEA hosts geo-block US datacenter IPs, so US regions return blank pages.
 export const runtime = "nodejs";
 export const preferredRegion = ["sin1", "hkg1", "icn1"];
-export const maxDuration = 60;
+export const maxDuration = 90;
 
 /**
  * Resolves a potentially relative URL against a base URL.
@@ -83,17 +83,21 @@ async function fetchHtml(
   }
 
   // Tier 2: ScraperAPI (residential IPs + JS rendering for Cloudflare challenges)
-  // Skip ScraperAPI for URLs with binary-looking extensions — it rejects those
-  // even though the actual response is HTML (e.g., videccdn.xyz/...mp4 pages).
+  // ScraperAPI rejects URLs ending in file extensions like .mp4 — we sidestep that
+  // by appending a dummy query param so the URL no longer looks like a file.
   const looksLikeFile = /\.(mp4|webm|m3u8|mkv|jpg|jpeg|png|gif|pdf|zip)(\?|$)/i.test(
     pageUrl
   );
   const key = process.env.SCRAPERAPI_KEY;
-  if (key && !looksLikeFile) {
+  if (key) {
     try {
+      const targetUrl = looksLikeFile
+        ? pageUrl + (pageUrl.includes("?") ? "&" : "?") + "_h=1"
+        : pageUrl;
+
       const proxyUrl = new URL("https://api.scraperapi.com/");
       proxyUrl.searchParams.set("api_key", key);
-      proxyUrl.searchParams.set("url", pageUrl);
+      proxyUrl.searchParams.set("url", targetUrl);
       // render=true executes JS — required to clear Cloudflare's "Just a moment..." challenge
       proxyUrl.searchParams.set("render", "true");
       proxyUrl.searchParams.set("keep_headers", "true");
@@ -115,8 +119,6 @@ async function fetchHtml(
     } catch (e) {
       console.log(`[Phase 1] scraperapi threw:`, e);
     }
-  } else if (looksLikeFile) {
-    console.log("[Phase 1] URL looks like a file, skipping ScraperAPI (it rejects file extensions)");
   } else {
     console.log("[Phase 1] SCRAPERAPI_KEY not set — skipping tier 2");
   }
@@ -209,28 +211,46 @@ async function fetchWithChromium(
 
     await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-    // Poll for Cloudflare challenge to clear (up to 25s)
-    const challengeTimeout = 25000;
-    const pollInterval = 1000;
+    // Poll for Cloudflare challenge to clear (up to 50s).
+    // Check both title and body content — cleared pages have <video>, real titles, etc.
+    const challengeTimeout = 50000;
+    const pollInterval = 1500;
     const start = Date.now();
+    let lastTitle = "";
     while (Date.now() - start < challengeTimeout) {
       const title = await page.title().catch(() => "");
-      const challenged = /just a moment|attention required|checking your browser/i.test(
-        title
-      );
-      if (!challenged) {
-        // Title cleared, give the rest of the page a beat to render
-        await new Promise((r) => setTimeout(r, 1500));
+      const titleChallenged =
+        /just a moment|attention required|checking your browser|please wait/i.test(
+          title
+        );
+
+      // Also check if page has actual content beyond Cloudflare's challenge
+      const hasRealContent = await page
+        .evaluate(() => {
+          if (document.querySelector("video, iframe, source")) return true;
+          const bodyText = document.body?.innerText || "";
+          return bodyText.length > 200 && !bodyText.toLowerCase().includes("checking your browser");
+        })
+        .catch(() => false);
+
+      if (!titleChallenged && hasRealContent) {
+        console.log(
+          `[Phase 1] chromium challenge cleared after ${Date.now() - start}ms (title: "${title}")`
+        );
+        // Give the rest of the page a beat to render
+        await new Promise((r) => setTimeout(r, 2000));
         break;
+      }
+      if (title !== lastTitle) {
+        console.log(`[Phase 1] chromium polling, title="${title}" hasContent=${hasRealContent}`);
+        lastTitle = title;
       }
       await new Promise((r) => setTimeout(r, pollInterval));
     }
 
     const html = await page.content();
     console.log(
-      `[Phase 1] chromium got ${html.length} chars (title polling ${
-        Date.now() - start
-      }ms)`
+      `[Phase 1] chromium got ${html.length} chars (total time ${Date.now() - start}ms)`
     );
     return html;
   } finally {
