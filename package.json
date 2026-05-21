@@ -1,7 +1,8 @@
 {
-  "name": "doomsday",
-  "version": "0.1.0",
+  "name": "doomsday-player",
+  "version": "1.0.0",
   "private": true,
+  "description": "Lightweight web player that streams hotlink-protected videos by spoofing the Referer header server-side.",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -9,9 +10,8 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "@sparticuz/chromium-min": "^148.0.0",
+    "hls.js": "^1.5.17",
     "next": "16.1.4",
-    "puppeteer-core": "^25.0.4",
     "react": "19.2.3",
     "react-dom": "19.2.3"
   },

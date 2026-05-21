@@ -1,50 +1,69 @@
 import { NextRequest } from "next/server";
+import { verifyParams } from "@/app/lib/sign";
 
+// Node runtime so we can stream large bodies without timeout pressure.
+// Edge runtime would be faster startup, but Vercel caps Edge response size.
 export const runtime = "nodejs";
 export const preferredRegion = ["sin1", "hkg1", "icn1"];
 export const maxDuration = 300;
 
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
 /**
  * Streaming proxy for hotlink-protected videos.
  *
- * Many video hosts check the Referer header and reject direct requests from
- * other origins. This endpoint fetches the video server-side with the correct
- * Referer (the original source page), then pipes the response back to the
- * browser. Range requests are forwarded for seek support.
+ * The Telegram bot signs (url + ref + exp) with STREAM_SECRET and embeds the
+ * signature in the link. We verify here so this endpoint can't be used as a
+ * free open proxy by random visitors — only links the bot generated work,
+ * and only until they expire.
  *
- * Usage: /api/stream?url=<video_url>&ref=<source_page_url>
+ * Two response shapes:
+ *   1. Direct media (mp4, webm, etc) → upstream body is piped 1:1 with Range
+ *      forwarding so seek/scrub works.
+ *   2. HLS manifest (m3u8) → text body is rewritten so every nested URL
+ *      (segments, sub-playlists, encryption keys) routes back through this
+ *      proxy. Otherwise the browser would request segments directly from the
+ *      upstream CDN with no Referer, and they'd fail.
+ *
+ * Usage: /api/stream?url=<video>&ref=<source>&exp=<unix>&sig=<hmac>
  */
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const videoUrl = searchParams.get("url");
   const ref = searchParams.get("ref");
+  const expStr = searchParams.get("exp");
+  const sig = searchParams.get("sig");
 
-  if (!videoUrl) {
-    return new Response("Missing url parameter", { status: 400 });
+  if (!videoUrl) return badRequest("Missing url");
+  if (!expStr || !sig) return forbidden("Missing signature");
+
+  const exp = Number(expStr);
+  const secret = process.env.STREAM_SECRET;
+  if (!secret) {
+    console.error("[stream] STREAM_SECRET env not set");
+    return new Response("Server misconfigured", { status: 500 });
   }
+
+  const valid = await verifyParams(secret, { url: videoUrl, ref, exp }, sig);
+  if (!valid) return forbidden("Invalid or expired signature");
 
   let target: URL;
   try {
     target = new URL(videoUrl);
     if (target.protocol !== "http:" && target.protocol !== "https:") {
-      return new Response("Invalid protocol", { status: 400 });
+      return badRequest("Invalid protocol");
     }
   } catch {
-    return new Response("Invalid url", { status: 400 });
+    return badRequest("Invalid url");
   }
 
-  // Use ref origin as the Referer; fall back to the video's own origin
-  let referer = target.origin + "/";
-  if (ref) {
-    try {
-      referer = new URL(ref).origin + "/";
-    } catch {}
-  }
+  // Fall back to the video's own origin if no Referer was provided.
+  const referer = ref ? safeOrigin(ref) : `${target.origin}/`;
 
-  // Forward Range header for video seeking
   const headers: Record<string, string> = {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": USER_AGENT,
     Referer: referer,
     Origin: referer.replace(/\/$/, ""),
     Accept: "*/*",
@@ -56,7 +75,7 @@ export async function GET(req: NextRequest) {
 
   let upstream: Response;
   try {
-    upstream = await fetch(target.toString(), { headers });
+    upstream = await fetch(target.toString(), { headers, redirect: "follow" });
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "fetch failed";
     return new Response(`Upstream fetch failed: ${message}`, { status: 502 });
@@ -69,7 +88,21 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  // Forward the response headers needed for video playback
+  const contentType = upstream.headers.get("content-type") || "";
+  const isHls =
+    /\.m3u8(\?|$)/i.test(target.pathname + target.search) ||
+    /application\/(vnd\.apple\.)?(mpegurl|x-mpegurl)/i.test(contentType);
+
+  if (isHls) {
+    return rewriteHlsManifest(upstream, target, ref, exp, sig, secret);
+  }
+
+  return passThrough(upstream);
+}
+
+// ---------------------------------------------------------------------------
+
+function passThrough(upstream: Response): Response {
   const responseHeaders = new Headers();
   const passthrough = [
     "content-type",
@@ -84,20 +117,135 @@ export async function GET(req: NextRequest) {
     const value = upstream.headers.get(key);
     if (value) responseHeaders.set(key, value);
   }
-
-  // Default content type if upstream didn't provide one
   if (!responseHeaders.has("content-type")) {
-    responseHeaders.set("content-type", "video/mp4");
+    responseHeaders.set("content-type", "application/octet-stream");
   }
   if (!responseHeaders.has("accept-ranges")) {
     responseHeaders.set("accept-ranges", "bytes");
   }
-
-  // Allow the video element to read the stream from any origin
+  // Player on a different deployment URL needs CORS to consume Range responses.
   responseHeaders.set("access-control-allow-origin", "*");
+  responseHeaders.set("access-control-expose-headers", "content-length,content-range");
 
   return new Response(upstream.body, {
     status: upstream.status,
     headers: responseHeaders,
   });
+}
+
+/**
+ * For HLS, every segment URL in the manifest must come back through us so the
+ * Referer is preserved on each fetch. We re-sign each child URL with the SAME
+ * exp/sig pair the parent used — a small abuse vector trade-off (one valid
+ * playback session = many segment requests) versus the alternative of signing
+ * every child individually, which would explode the manifest size.
+ *
+ * Actually, signatures are bound to the URL, so reusing the parent sig won't
+ * verify against child URLs. We need to mint fresh signatures per child. Doing
+ * that requires a sign function in the verifier module.
+ */
+async function rewriteHlsManifest(
+  upstream: Response,
+  manifestUrl: URL,
+  ref: string | null,
+  exp: number,
+  _parentSig: string,
+  secret: string
+): Promise<Response> {
+  const text = await upstream.text();
+  const { signParams } = await import("@/app/lib/sign");
+
+  const lines = text.split(/\r?\n/);
+  const out: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const line = raw.trim();
+
+    if (line.length === 0 || line.startsWith("#")) {
+      // Tags can also embed URIs (e.g. EXT-X-KEY:URI="...", EXT-X-MAP:URI="...").
+      const rewritten = await rewriteTagUris(raw, manifestUrl, ref, exp, secret, signParams);
+      out.push(rewritten);
+      continue;
+    }
+
+    // Plain URI line (segment or variant playlist).
+    const absolute = resolveUri(line, manifestUrl);
+    out.push(await proxyUriFor(absolute, ref, exp, secret, signParams));
+  }
+
+  const headers = new Headers();
+  headers.set("content-type", "application/vnd.apple.mpegurl");
+  headers.set("cache-control", "no-store");
+  headers.set("access-control-allow-origin", "*");
+
+  return new Response(out.join("\n"), { status: 200, headers });
+}
+
+async function rewriteTagUris(
+  raw: string,
+  manifestUrl: URL,
+  ref: string | null,
+  exp: number,
+  secret: string,
+  signParams: typeof import("@/app/lib/sign").signParams
+): Promise<string> {
+  // Match URI="..." attributes and rewrite the inner URI.
+  const uriPattern = /URI="([^"]+)"/g;
+  let match: RegExpExecArray | null;
+  let result = raw;
+  const replacements: Array<{ from: string; to: string }> = [];
+
+  while ((match = uriPattern.exec(raw)) !== null) {
+    const original = match[1];
+    const absolute = resolveUri(original, manifestUrl);
+    const proxied = await proxyUriFor(absolute, ref, exp, secret, signParams);
+    replacements.push({ from: match[0], to: `URI="${proxied}"` });
+  }
+
+  for (const { from, to } of replacements) {
+    result = result.replace(from, to);
+  }
+  return result;
+}
+
+async function proxyUriFor(
+  absolute: string,
+  ref: string | null,
+  exp: number,
+  secret: string,
+  signParams: typeof import("@/app/lib/sign").signParams
+): Promise<string> {
+  const sig = await signParams(secret, { url: absolute, ref, exp });
+  const params = new URLSearchParams({
+    url: absolute,
+    exp: String(exp),
+    sig,
+  });
+  if (ref) params.set("ref", ref);
+  return `/api/stream?${params.toString()}`;
+}
+
+function resolveUri(raw: string, base: URL): string {
+  try {
+    return new URL(raw, base).toString();
+  } catch {
+    return raw;
+  }
+}
+
+function safeOrigin(value: string): string {
+  try {
+    return new URL(value).origin + "/";
+  } catch {
+    return value;
+  }
+}
+
+function badRequest(msg: string) {
+  return new Response(msg, { status: 400 });
+}
+
+function forbidden(msg: string) {
+  return new Response(msg, { status: 403 });
 }
