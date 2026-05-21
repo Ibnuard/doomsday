@@ -137,7 +137,7 @@ export default function Home() {
             Enter a website URL to check for downloadable videos.
           </p>
           <p className="mt-1 text-xs text-zinc-400 dark:text-zinc-500">
-            v1.2.0 — Smart Click Loop + Save Videos
+            v2 — Smart Opus
           </p>
         </div>
 
