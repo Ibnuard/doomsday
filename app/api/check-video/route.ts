@@ -83,8 +83,13 @@ async function fetchHtml(
   }
 
   // Tier 2: ScraperAPI (residential IPs + JS rendering for Cloudflare challenges)
+  // Skip ScraperAPI for URLs with binary-looking extensions — it rejects those
+  // even though the actual response is HTML (e.g., videccdn.xyz/...mp4 pages).
+  const looksLikeFile = /\.(mp4|webm|m3u8|mkv|jpg|jpeg|png|gif|pdf|zip)(\?|$)/i.test(
+    pageUrl
+  );
   const key = process.env.SCRAPERAPI_KEY;
-  if (key) {
+  if (key && !looksLikeFile) {
     try {
       const proxyUrl = new URL("https://api.scraperapi.com/");
       proxyUrl.searchParams.set("api_key", key);
@@ -110,6 +115,8 @@ async function fetchHtml(
     } catch (e) {
       console.log(`[Phase 1] scraperapi threw:`, e);
     }
+  } else if (looksLikeFile) {
+    console.log("[Phase 1] URL looks like a file, skipping ScraperAPI (it rejects file extensions)");
   } else {
     console.log("[Phase 1] SCRAPERAPI_KEY not set — skipping tier 2");
   }
@@ -167,12 +174,32 @@ async function fetchWithChromium(
     const executablePath = await getChromiumPath();
 
     browser = await puppeteer.launch({
-      args: chromium.args,
+      args: [
+        ...chromium.args,
+        // Stealth flags to reduce bot detection
+        "--disable-blink-features=AutomationControlled",
+        "--disable-features=IsolateOrigins,site-per-process",
+      ],
+      defaultViewport: { width: 1280, height: 720 },
       executablePath,
       headless: true,
     });
 
     const page = await browser.newPage();
+
+    // Stealth: hide automation indicators before any page script runs
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (window as any).chrome = { runtime: {} };
+      Object.defineProperty(navigator, "plugins", {
+        get: () => [1, 2, 3, 4, 5],
+      });
+      Object.defineProperty(navigator, "languages", {
+        get: () => ["en-US", "en"],
+      });
+    });
+
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     );
@@ -181,10 +208,31 @@ async function fetchWithChromium(
     }
 
     await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-    // Wait a bit for Cloudflare challenge to clear
-    await new Promise((r) => setTimeout(r, 5000));
 
-    return await page.content();
+    // Poll for Cloudflare challenge to clear (up to 25s)
+    const challengeTimeout = 25000;
+    const pollInterval = 1000;
+    const start = Date.now();
+    while (Date.now() - start < challengeTimeout) {
+      const title = await page.title().catch(() => "");
+      const challenged = /just a moment|attention required|checking your browser/i.test(
+        title
+      );
+      if (!challenged) {
+        // Title cleared, give the rest of the page a beat to render
+        await new Promise((r) => setTimeout(r, 1500));
+        break;
+      }
+      await new Promise((r) => setTimeout(r, pollInterval));
+    }
+
+    const html = await page.content();
+    console.log(
+      `[Phase 1] chromium got ${html.length} chars (title polling ${
+        Date.now() - start
+      }ms)`
+    );
+    return html;
   } finally {
     if (browser) {
       try {
