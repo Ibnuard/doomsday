@@ -8,14 +8,26 @@ interface SavedVideo {
   savedAt: string;
 }
 
+interface StreamingState {
+  url: string;
+  sourceUrl: string;
+}
+
 const STORAGE_KEY = 'doomsday_saved_videos';
+
+// Build a proxy URL that streams the video server-side with the correct Referer.
+// Required for hosts that hotlink-protect their content (e.g., videccdn.xyz).
+function proxyUrl(videoUrl: string, sourceUrl: string) {
+  const params = new URLSearchParams({ url: videoUrl, ref: sourceUrl });
+  return `/api/stream?${params.toString()}`;
+}
 
 export default function Home() {
   const [url, setUrl] = useState('');
   const [loading, setLoading] = useState(false);
   const [videos, setVideos] = useState<string[]>([]);
   const [message, setMessage] = useState('');
-  const [streamingUrl, setStreamingUrl] = useState<string | null>(null);
+  const [streaming, setStreaming] = useState<StreamingState | null>(null);
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [savedVideos, setSavedVideos] = useState<SavedVideo[]>([]);
   const [showSavedVideos, setShowSavedVideos] = useState(false);
@@ -76,7 +88,7 @@ export default function Home() {
     setUrl('');
     setVideos([]);
     setMessage('');
-    setStreamingUrl(null);
+    setStreaming(null);
   };
 
   const checkVideo = async () => {
@@ -84,7 +96,7 @@ export default function Home() {
     setLoading(true);
     setMessage('');
     setVideos([]);
-    setStreamingUrl(null);
+    setStreaming(null);
 
     try {
       const res = await fetch('/api/check-video', {
@@ -163,13 +175,13 @@ export default function Home() {
                       {copiedIndex === 1000 + index ? '✓ Tersalin!' : '📋 Salin'}
                     </button>
                     <button
-                      onClick={() => setStreamingUrl(saved.url)}
+                      onClick={() => setStreaming({ url: saved.url, sourceUrl: saved.sourceUrl })}
                       className="rounded-md bg-purple-600 px-3 py-1 text-xs font-medium text-white hover:bg-purple-700"
                     >
                       ▶ Stream
                     </button>
                     <a
-                      href={saved.url}
+                      href={proxyUrl(saved.url, saved.sourceUrl)}
                       download
                       target="_blank"
                       rel="noopener noreferrer"
@@ -223,19 +235,19 @@ export default function Home() {
         )}
 
         {/* Video Player Modal */}
-        {streamingUrl && (
+        {streaming && (
           <div className="w-full rounded-xl border border-zinc-200 bg-black p-2 dark:border-zinc-700">
             <div className="mb-2 flex items-center justify-between">
               <span className="text-sm text-white">Now Streaming</span>
               <button
-                onClick={() => setStreamingUrl(null)}
+                onClick={() => setStreaming(null)}
                 className="rounded px-2 py-1 text-sm text-white hover:bg-zinc-700"
               >
                 ✕ Close
               </button>
             </div>
             <video
-              src={streamingUrl}
+              src={proxyUrl(streaming.url, streaming.sourceUrl)}
               controls
               autoPlay
               className="w-full rounded-lg"
@@ -268,13 +280,13 @@ export default function Home() {
                     {copiedIndex === index ? '✓ Tersalin!' : '📋 Salin Link'}
                   </button>
                   <button
-                    onClick={() => setStreamingUrl(videoUrl)}
+                    onClick={() => setStreaming({ url: videoUrl, sourceUrl: url })}
                     className="rounded-md bg-purple-600 px-4 py-2 text-sm font-medium text-white hover:bg-purple-700"
                   >
                     ▶ Stream
                   </button>
                   <a
-                    href={videoUrl}
+                    href={proxyUrl(videoUrl, url)}
                     download
                     target="_blank"
                     rel="noopener noreferrer"
